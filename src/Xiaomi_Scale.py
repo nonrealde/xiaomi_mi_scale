@@ -4,10 +4,12 @@ import asyncio
 import binascii
 from bleak import BleakScanner
 from collections import namedtuple
+from Cryptodome.Cipher import AES
 from datetime import datetime
 import functools
 import json
 import paho.mqtt.publish as publish
+import struct
 import subprocess
 import sys
 import logging
@@ -16,7 +18,11 @@ import os
 import Xiaomi_Scale_Body_Metrics
 
 DEFAULT_DEBUG_LEVEL = "INFO"
-VERSION = "0.3.5"
+VERSION = "0.4.0"
+
+# Xiaomi S400 (MJTZC01YM) BLE MiBeacon device type and Body Composition data object IDs
+XIAOMI_S400_DEVICE_ID = 0x3BD5
+XIAOMI_S400_BODY_COMPOSITION_OBJ_ID = 0x6E16
 
 
 
@@ -57,7 +63,7 @@ def GetAge(d1):
     d2 = datetime.strptime(datetime.today().strftime('%Y-%m-%d'),'%Y-%m-%d')
     return abs((d2 - d1).days)/365
     
-def MQTT_publish(weight, unit, mitdatetime, hasImpedance, miimpedance):
+def MQTT_publish(weight, unit, mitdatetime, hasImpedance, miimpedance, heartRate=None):
     """Publishes weight data for the selected user"""
     if unit == "lbs": calcweight = round(weight * 0.4536, 2)
     if unit == "jin": calcweight = round(weight * 0.5, 2)
@@ -95,6 +101,9 @@ def MQTT_publish(weight, unit, mitdatetime, hasImpedance, miimpedance):
         message += ',"metabolic_age":' + "{:.0f}".format(lib.getMetabolicAge())
         message += ',"impedance":' + "{:.0f}".format(int(miimpedance))
 
+    if heartRate:
+        message += ',"heart_rate":' + "{:.0f}".format(heartRate)
+
     message += ',"timestamp":"' + mitdatetime + '"'
     message += '}'
     try:
@@ -112,6 +121,84 @@ def MQTT_publish(weight, unit, mitdatetime, hasImpedance, miimpedance):
     except Exception as error:
         logging.error(f"Could not publish to MQTT: {error}")
         raise
+
+def parse_s400(mac_bytes, service_data, bindkey):
+    """Decode a Xiaomi S400 (MJTZC01YM) MiBeacon advertisement.
+
+    Unlike the older V1/V2 scales, the S400 broadcasts its measurements
+    inside an encrypted Xiaomi MiBeacon frame (service UUID 0xFE95). The
+    frame needs to be decrypted with AES-CCM using the scale's per-device
+    bind key before the Body Composition data object (0x6E16) can be read.
+    The bind key can be extracted from the user's Xiaomi account, e.g. with
+    https://github.com/PiotrMachowski/Xiaomi-cloud-tokens-extractor
+
+    Returns a dict with any of 'weight' (kg), 'impedance' (Ohm) and
+    'heart_rate' (bpm) present in the broadcast, or None if the
+    advertisement isn't a decodable S400 Body Composition packet.
+    """
+    if len(service_data) < 5:
+        return None
+
+    frctrl = service_data[0] | (service_data[1] << 8)
+    device_id = service_data[2] | (service_data[3] << 8)
+    if device_id != XIAOMI_S400_DEVICE_ID:
+        return None
+
+    has_mac = (frctrl >> 4) & 1
+    has_capability = (frctrl >> 5) & 1
+    has_object = (frctrl >> 6) & 1
+    is_encrypted = (frctrl >> 3) & 1
+
+    if not has_object:
+        return None
+
+    offset = 5
+    if has_mac:
+        offset += 6
+    if has_capability:
+        capability = service_data[offset]
+        offset += 1
+        if capability & 0x20:
+            offset += 1
+
+    if is_encrypted:
+        if not bindkey:
+            logging.warning(f"S400 scale detected but MISCALE_BINDKEY is not configured, cannot decrypt data...")
+            return None
+        # MiBeacon v4/v5 AES-CCM: nonce = reversed MAC + device_id + packet_id + 3-byte counter,
+        # ciphertext is followed by a 3-byte counter and a 4-byte auth tag.
+        nonce = mac_bytes[::-1] + service_data[2:5] + service_data[-7:-4]
+        tag = service_data[-4:]
+        ciphertext = service_data[offset:-7]
+        cipher = AES.new(bytes.fromhex(bindkey), AES.MODE_CCM, nonce=nonce, mac_len=4)
+        cipher.update(b"\x11")
+        try:
+            payload = cipher.decrypt_and_verify(ciphertext, tag)
+        except ValueError as error:
+            logging.debug(f"S400 decryption failed, check MISCALE_BINDKEY: {error}")
+            return None
+    else:
+        payload = service_data[offset:]
+
+    result = {}
+    pos = 0
+    while pos + 3 <= len(payload):
+        obj_id = payload[pos] | (payload[pos + 1] << 8)
+        obj_len = payload[pos + 2]
+        obj_data = payload[pos + 3:pos + 3 + obj_len]
+        if obj_id == XIAOMI_S400_BODY_COMPOSITION_OBJ_ID and obj_len == 9:
+            _, packed, _ = struct.unpack("<BII", obj_data)
+            mass_raw = packed & 0x7FF
+            heart_rate_raw = (packed >> 11) & 0x7F
+            impedance_raw = packed >> 18
+            if mass_raw:
+                result["weight"] = mass_raw / 10
+            if 0 < heart_rate_raw < 127:
+                result["heart_rate"] = heart_rate_raw + 50
+            if impedance_raw:
+                result["impedance"] = impedance_raw / 10
+        pos += 3 + obj_len
+    return result or None
 
 os.system('clear')
 
@@ -160,6 +247,13 @@ try:
             MISCALE_VERSION = data["MISCALE_VERSION"]
             logging.info(f"MISCALE_VERSION option is deprecated and can safely be removed from config...")
         except:
+            pass
+        try:
+            MISCALE_BINDKEY = data["MISCALE_BINDKEY"]
+            logging.debug(f"MISCALE_BINDKEY read from config: ***")
+        except:
+            MISCALE_BINDKEY = None
+            logging.debug(f"MISCALE_BINDKEY not provided, S400 scale support will be disabled...")
             pass
         try:
             MQTT_USERNAME = data["MQTT_USERNAME"]
@@ -332,6 +426,24 @@ async def main(MISCALE_MAC):
                     if OLD_MEASURE != round(measured, 2):
                         OLD_MEASURE = round(measured, 2)
                         MQTT_publish(round(measured, 2), unit, str(datetime.now().strftime('%Y-%m-%dT%H:%M:%S+00:00')), "", "")
+            except:
+                pass
+            try:
+                ### Xiaomi S400 Scale ###
+                sd = advertising_data.service_data['0000fe95-0000-1000-8000-00805f9b34fb']
+                logging.debug(f"miscale s400 found (service data: 0000fe95-0000-1000-8000-00805f9b34fb)")
+                mac_bytes = bytes.fromhex(device.address.replace(':', ''))
+                s400 = parse_s400(mac_bytes, sd, MISCALE_BINDKEY)
+                weight = s400.get("weight") if s400 else None
+                if weight:
+                    impedance = s400.get("impedance")
+                    heart_rate = s400.get("heart_rate")
+                    hasImpedance = impedance is not None
+                    miimpedance = str(int(impedance)) if hasImpedance else ""
+                    dedup_key = round(weight, 2) + (int(impedance) if hasImpedance else 0)
+                    if OLD_MEASURE != dedup_key:
+                        OLD_MEASURE = dedup_key
+                        MQTT_publish(round(weight, 2), 'kg', str(datetime.now().strftime('%Y-%m-%dT%H:%M:%S+00:00')), hasImpedance, miimpedance, heart_rate)
             except:
                 pass
         pass

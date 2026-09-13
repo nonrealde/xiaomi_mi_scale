@@ -1,3 +1,7 @@
+## [0.4.0] - 2026-09-13
+### Added
+- Added support for the Xiaomi Body Composition Scale S400 (MJTZC01YM), including heart rate. Requires a new `MISCALE_BINDKEY` option to decrypt the scale's encrypted BLE advertisements (see README).
+
 ## [0.3.5] - 2022-10-10
 ### Added
 - Added extra logging. Logging Level can be set from config file.
