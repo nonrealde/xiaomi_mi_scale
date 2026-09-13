@@ -1,2 +1,3 @@
 bleak==0.18.0
 paho-mqtt==1.5.0
+pycryptodomex==3.20.0

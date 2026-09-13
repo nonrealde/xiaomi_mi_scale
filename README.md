@@ -15,6 +15,7 @@ Name | Model | Picture
 [Mi Smart Scale 2](https://www.mi.com/global/scale) &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; | XMTZCO1HM, XMTZC04HM | ![Mi Scale_2](Screenshots/Mi_Smart_Scale_2_Thumb.png)
 [Mi Body Composition Scale](https://www.mi.com/global/mi-body-composition-scale/) | XMTZC02HM | ![Mi Scale](Screenshots/Mi_Body_Composition_Scale_Thumb.png)
 [Mi Body Composition Scale 2](https://c.mi.com/thread-2289389-1-0.html) | XMTZC05HM | ![Mi Body Composition Scale 2](Screenshots/Mi_Body_Composition_Scale_2_Thumb.png)
+[Xiaomi Body Composition Scale S400](https://www.mi.com/global/product/xiaomi-body-composition-scale-s400/) | MJTZC01YM | 
 
 
 ## Home Assistant Add-On:
@@ -62,6 +63,7 @@ List of options
 Option | Type | Required | Description
 --- | --- | --- | ---
 MISCALE_MAC | string | Yes | Mac address of your scale
+MISCALE_BINDKEY | string | Only for S400 | 32-character (16 byte) hex bind key used to decrypt the S400's Bluetooth advertisements. See [S400 Setup](#xiaomi-body-composition-scale-s400-setup) below on how to obtain it. Not needed for other scale models.
 MQTT_HOST | string | Yes | MQTT Server (defaults to 127.0.0.1)
 HCI_DEV | string | No | Bluetooth hci device to use. Defaults to hci0
 MQTT_PREFIX | string | No | MQTT Topic Prefix. Defaults to miscale
@@ -91,6 +93,19 @@ HEIGHT | int | Yes | Height (in cm) of the user
 DOB | string | Yes | DOB (in yyyy-mm-dd format)
 
 Note: The weight definitions must be in the same unit as the scale (kg, Lbs, jin)
+
+### Xiaomi Body Composition Scale S400 Setup:
+
+Unlike the other scales listed above, the S400 (MJTZC01YM) encrypts its Bluetooth advertisements. To decrypt them, this script needs the scale's **bind key**, a per-device 16-byte (32 hex character) AES key.
+
+1. Add the scale to the Mi Home / Xiaomi Home app first, and take at least one measurement with it. The scale will not broadcast anything useful until it has been bound to a Xiaomi account.
+2. Extract the bind key from your Xiaomi account using [Xiaomi-cloud-tokens-extractor](https://github.com/PiotrMachowski/Xiaomi-cloud-tokens-extractor) (look for the entry matching your scale's MAC address / model `MJTZC01YM`).
+3. Add the key to `options.json` as `MISCALE_BINDKEY`.
+
+Notes/limitations:
+- The S400 only reports weight in kg and only sends a measurement broadcast right after you step off the scale (there's no continuous advertising like the older scales), so it can take a few seconds for a reading to arrive.
+- Heart rate and impedance are only included in the broadcast when the scale was able to measure them (e.g. impedance requires bare feet). When present, heart rate is published alongside weight/impedance in the MQTT message.
+- If the scale never seems to be detected, some USB Bluetooth adapters (e.g. RTL8761B-based ones) have been reported to have trouble catching the S400's short advertising window; a different adapter (e.g. CSR8510-based) may work more reliably.
 
 ### Running script directly on your host system:
 
